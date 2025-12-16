@@ -122,6 +122,53 @@ async function cleanup(filePath) {
 }
 
 /**
+ * Get video metadata using ffprobe
+ */
+function getVideoMetadata(videoPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(videoPath, (err, metadata) => {
+      if (err) return reject(err);
+
+      const videoStream = metadata.streams.find(
+        (s) => s.codec_type === "video"
+      );
+
+      if (!videoStream) {
+        return reject(new Error("No video stream found"));
+      }
+
+      const width = videoStream.width;
+      const height = videoStream.height;
+      const duration = metadata.format.duration || 0;
+      const size = metadata.format.size || 0;
+      const bitrate = metadata.format.bit_rate || 0;
+      const codec = videoStream.codec_name || "unknown";
+
+      // Parse frame rate (format: "30/1" or "25/1")
+      let fps = 0;
+      if (videoStream.r_frame_rate) {
+        const [num, den] = videoStream.r_frame_rate.split("/").map(Number);
+        fps = den ? num / den : num;
+      }
+
+      // A short video is typically vertical (height > width) - like TikTok/Instagram Reels
+      const isShort = height > width;
+
+      resolve({
+        width,
+        height,
+        duration,
+        size,
+        bitrate,
+        codec,
+        fps,
+        isShort,
+      });
+    });
+  });
+}
+
+/**
  * POST /extract-keyframes
  * Extract key frames from video (URL or upload)
  */
@@ -159,6 +206,9 @@ app.post("/extract-keyframes", upload.single("video"), async (req, res) => {
       });
     }
 
+    // Get video metadata
+    const videoMetadata = await getVideoMetadata(videoPath);
+ 
     // Create unique output directory
     const videoId = uuidv4();
     outputDir = path.join(__dirname, "uploads", videoId);
@@ -184,6 +234,16 @@ app.post("/extract-keyframes", upload.single("video"), async (req, res) => {
       interval,
       frameCount: frameUrls.length,
       keyFrames: frameUrls,
+      metadata: {
+        width: videoMetadata.width,
+        height: videoMetadata.height,
+        duration: videoMetadata.duration,
+        size: videoMetadata.size,
+        bitrate: videoMetadata.bitrate,
+        codec: videoMetadata.codec,
+        fps: videoMetadata.fps,
+      },
+      is_short: videoMetadata.isShort,
     });
   } catch (err) {
     console.error("Error:", err);
