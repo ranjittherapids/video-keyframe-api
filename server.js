@@ -122,6 +122,22 @@ async function cleanup(filePath) {
 }
 
 /**
+ * Format duration in seconds to time string (e.g., "0:59" or "1:23:45")
+ */
+function formatDuration(seconds) {
+  if (!seconds || seconds === 0) return "0:00";
+  
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+  }
+  return `${minutes}:${secs.toString().padStart(2, "0")}`;
+}
+
+/**
  * Get video metadata using ffprobe
  */
 function getVideoMetadata(videoPath) {
@@ -140,6 +156,7 @@ function getVideoMetadata(videoPath) {
       const width = videoStream.width;
       const height = videoStream.height;
       const duration = metadata.format.duration || 0;
+      const durationFormatted = formatDuration(duration);
       const size = metadata.format.size || 0;
       const bitrate = metadata.format.bit_rate || 0;
       const codec = videoStream.codec_name || "unknown";
@@ -158,6 +175,7 @@ function getVideoMetadata(videoPath) {
         width,
         height,
         duration,
+        durationFormatted,
         size,
         bitrate,
         codec,
@@ -237,7 +255,7 @@ app.post("/extract-keyframes", upload.single("video"), async (req, res) => {
       metadata: {
         width: videoMetadata.width,
         height: videoMetadata.height,
-        duration: videoMetadata.duration,
+        duration: videoMetadata.durationFormatted, 
         size: videoMetadata.size,
         bitrate: videoMetadata.bitrate,
         codec: videoMetadata.codec,
