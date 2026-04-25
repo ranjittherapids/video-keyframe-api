@@ -1,63 +1,50 @@
 // server.js
 const express = require("express");
-const multer = require("multer");
 const ffmpeg = require("fluent-ffmpeg");
 const axios = require("axios");
 const fs = require("fs").promises;
 const path = require("path");
-const { v4: uuidv4 } = require("uuid");
+const { randomUUID } = require("crypto");
 const fsSync = require("fs");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const LOGS_DIR = path.join(__dirname, "logs");
+const DOWNLOAD_LOG_FILE = path.join(LOGS_DIR, "video-download.log");
 
 // Middleware
 app.use(express.json());
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: async (req, file, cb) => {
-    const tempDir = path.join(__dirname, "temp");
-    if (!fsSync.existsSync(tempDir)) {
-      await fs.mkdir(tempDir, { recursive: true });
-    }
-    cb(null, tempDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueName = `${uuidv4()}${path.extname(file.originalname)}`;
-    cb(null, uniqueName);
-  },
-});
+async function ensureDirectory(dirPath) {
+  if (!fsSync.existsSync(dirPath)) {
+    await fs.mkdir(dirPath, { recursive: true });
+  }
+}
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB limit
-  fileFilter: (req, file, cb) => {
-    const allowedMimes = [
-      "video/mp4",
-      "video/mpeg",
-      "video/quicktime",
-      "video/x-msvideo",
-      "video/webm",
-    ];
-    if (allowedMimes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Invalid file type. Only video files are allowed."));
-    }
-  },
-});
+async function logDownloadEvent(level, message, metadata = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...metadata,
+  };
+
+  try {
+    await ensureDirectory(LOGS_DIR);
+    await fs.appendFile(DOWNLOAD_LOG_FILE, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (err) {
+    console.error("Failed to write log file:", err.message);
+  }
+}
 
 /**
  * Download video from URL to temp directory
  */
 async function downloadVideo(url) {
   const tempDir = path.join(__dirname, "temp");
-  if (!fsSync.existsSync(tempDir)) {
-    await fs.mkdir(tempDir, { recursive: true });
-  }
+  await ensureDirectory(tempDir);
 
-  const videoPath = path.join(tempDir, `${uuidv4()}.mp4`);
+    const videoPath = path.join(tempDir, `${randomUUID()}.mp4`);
   const writer = fsSync.createWriteStream(videoPath);
 
   const response = await axios({
@@ -188,9 +175,9 @@ function getVideoMetadata(videoPath) {
 
 /**
  * POST /extract-keyframes
- * Extract key frames from video (URL or upload)
+ * Extract key frames from video URL
  */
-app.post("/extract-keyframes", upload.single("video"), async (req, res) => {
+app.post("/extract-keyframes", async (req, res) => {
   let videoPath = null;
   let outputDir = null;
 
@@ -204,23 +191,49 @@ app.post("/extract-keyframes", upload.single("video"), async (req, res) => {
       });
     }
 
-    // Handle video source (URL or file upload)
-    if (req.body.videoUrl) {
-      // Download from URL
-      try {
-        videoPath = await downloadVideo(req.body.videoUrl);
-      } catch (err) {
-        return res.status(400).json({
-          error: "Failed to download video from URL",
-          details: err.message,
-        });
-      }
-    } else if (req.file) {
-      // Use uploaded file
-      videoPath = req.file.path;
-    } else {
+    // Handle video source (URL only)
+    const { videoUrl } = req.body;
+    if (!videoUrl) {
       return res.status(400).json({
-        error: "Either videoUrl or video file must be provided",
+        error: "videoUrl is required",
+      });
+    }
+
+    await logDownloadEvent("info", "Received extract request", {
+      videoUrl,
+      interval,
+      clientIp: req.ip,
+      userAgent: req.get("user-agent") || null,
+    });
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(videoUrl);
+    } catch (err) {
+      return res.status(400).json({
+        error: "videoUrl must be a valid URL",
+      });
+    }
+
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      return res.status(400).json({
+        error: "videoUrl must use http or https protocol",
+      });
+    }
+
+    // Download from URL
+    try {
+      videoPath = await downloadVideo(videoUrl);
+    } catch (err) {
+      await logDownloadEvent("error", "Download failed", {
+        videoUrl,
+        statusCode: err.response?.status || null,
+        statusText: err.response?.statusText || null,
+        errorMessage: err.message,
+      });
+      return res.status(400).json({
+        error: "Failed to download video from URL",
+        details: err.message,
       });
     }
 
@@ -228,7 +241,7 @@ app.post("/extract-keyframes", upload.single("video"), async (req, res) => {
     const videoMetadata = await getVideoMetadata(videoPath);
  
     // Create unique output directory
-    const videoId = uuidv4();
+    const videoId = randomUUID();
     outputDir = path.join(__dirname, "uploads", videoId);
     await fs.mkdir(outputDir, { recursive: true });
 
@@ -263,8 +276,17 @@ app.post("/extract-keyframes", upload.single("video"), async (req, res) => {
       },
       is_short: videoMetadata.isShort,
     });
+    await logDownloadEvent("info", "Extract completed", {
+      videoUrl,
+      frameCount: frameUrls.length,
+      videoId,
+    });
   } catch (err) {
     console.error("Error:", err);
+    await logDownloadEvent("error", "Extract failed", {
+      errorMessage: err.message,
+      stack: err.stack || null,
+    });
 
     // Cleanup on error
     if (outputDir) {
@@ -284,6 +306,24 @@ app.post("/extract-keyframes", upload.single("video"), async (req, res) => {
     if (videoPath) {
       await cleanup(videoPath);
     }
+  }
+});
+
+/**
+ * GET /logs/download
+ * Download server download log file
+ */
+app.get("/logs/download", async (req, res) => {
+  try {
+    if (!fsSync.existsSync(DOWNLOAD_LOG_FILE)) {
+      return res.status(404).json({ error: "Log file not found" });
+    }
+    return res.download(DOWNLOAD_LOG_FILE, "video-download.log");
+  } catch (err) {
+    return res.status(500).json({
+      error: "Failed to download log file",
+      details: err.message,
+    });
   }
 });
 
@@ -346,6 +386,7 @@ app.listen(PORT, () => {
   console.log(`📍 POST /extract-keyframes - Extract frames from video`);
   console.log(`📍 GET /frames/:videoId/:frameName - Retrieve frame image`);
   console.log(`📍 DELETE /frames/:videoId - Delete all frames`);
+  console.log(`📍 GET /logs/download - Download server log file`);
   console.log(`📍 GET /health - Health check`);
 });
 
